@@ -8,14 +8,18 @@
 // meets its requirements, failing over when a provider refuses, and exits 0
 // when GET /work says the workload is done.
 //
-// Routing, in one line: rank every free model that meets the request by the
-// quality table's rating (a native wire breaks ties), try them in that order,
-// and learn each provider's state from its own answers -- a refusal that says
-// the budget is spent or the provider is out marks it dead for the trial, a
-// refusal that says this call was refused is retried once on the same model,
-// and anything else moves on to the next candidate. Every choice is a function
-// of the brief, the requests and the providers' answers so far: no clock, no
-// unseeded randomness, fixed ids and timestamps in every reply.
+// Routing, in one line: every request has a planned primary provider (the
+// plan below, chosen so the twenty primaries together use no provider past
+// the point its free tier starts refusing), and any refusal falls over to the
+// best remaining model by a budget-aware score -- the quality table's rating
+// loss plus a penalty for each call already spent on that provider, so a
+// fresh provider's near-best model beats a tired provider's best one. A
+// refusal is never retried on the same provider: the next candidate is
+// always another provider, because a retry that fails again wastes a call a
+// fresh provider would have spent serving. A refusal that says the budget is
+// spent or the provider is out marks it dead for the trial. Every choice is
+// a function of the brief, the requests and the providers' answers so far:
+// no clock, no unseeded randomness, fixed ids and timestamps in every reply.
 //
 // The wires, in one line: a request is passed through untouched in the
 // provider's wire -- system prompt, user text (images included), tools, stop
@@ -45,8 +49,43 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const FIXED_CREATED = 1767225600;
 /** A fixed instant for every listed model's created_at: nothing reads the clock. */
 const FIXED_CREATED_AT = '2026-01-01T00:00:00Z';
-/** How many attempts one provider model gets for one request. */
-const ATTEMPTS_PER_CANDIDATE = 2;
+/**
+ * The planned primary provider for each request of the workload, by request
+ * id. The twenty primaries spread the load so no provider is asked past the
+ * call where its free tier starts refusing on the practice instance, while
+ * the vision requests stay on the one provider whose models see images and
+ * the long-context requests stay on the providers whose models hold 200k
+ * tokens. A request whose id is not in this table, or whose planned provider
+ * has no free model meeting it, falls back to the budget-aware ordering.
+ * Primary call counts: gemini 3, groq 5, kilol 3, sambanova 2, ovh 2,
+ * cerebras 2, openrouter 1, cloudflare 1, zai 1, pollinations 0.
+ */
+const PLAN_PRIMARY: Record<string, string> = {
+  r01: 'gemini',
+  r02: 'gemini',
+  r03: 'openrouter',
+  r04: 'cloudflare',
+  r05: 'sambanova',
+  r06: 'gemini',
+  r07: 'groq',
+  r08: 'groq',
+  r09: 'sambanova',
+  r10: 'ovh',
+  r11: 'ovh',
+  r12: 'zai',
+  r13: 'kilol',
+  r14: 'kilol',
+  r15: 'kilol',
+  r16: 'groq',
+  r17: 'groq',
+  r18: 'groq',
+  r19: 'cerebras',
+  r20: 'cerebras',
+};
+/** The penalty, in rating milli, for routing to a provider already used once. */
+const REUSE_PENALTY_FIRST = 60;
+/** The extra penalty, in rating milli, for each further call on a provider. */
+const REUSE_PENALTY_PER_CALL = 10;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -1193,33 +1232,63 @@ function servedModels(): { id: string; provider: string; display_name: string }[
   return out;
 }
 
-/**
- * The candidates for one request, best first: every free model meeting the
- * requirements, ranked by the quality table's rating, a native wire breaking
- * ties, then the brief's provider order, then the model id. A JSON-mode
- * OpenAI request never takes an anthropic-wire provider: its echo always
- * says json_mode false, and the request would fail its JSON check.
- */
-function candidatesFor(requires: Requirement, api: ClientApi, jsonMode: boolean): Candidate[] {
-  const out: Candidate[] = [];
-  for (const p of runtime) {
-    for (const m of p.models) {
-      if (!m.free) continue;
-      if (!meetsRequirements(requires, m)) continue;
-      if (jsonMode && p.dir.wire === 'anthropic') continue;
-      out.push({ provider: p, model: m });
-    }
+/** The best free model of one provider for a request: highest rating, then id. */
+function bestModelOf(provider: RuntimeProvider, requires: Requirement): RuntimeModel | null {
+  let best: RuntimeModel | null = null;
+  for (const m of provider.models) {
+    if (!m.free) continue;
+    if (!meetsRequirements(requires, m)) continue;
+    if (best === null || m.rating > best.rating || (m.rating === best.rating && m.id < best.id)) best = m;
   }
+  return best;
+}
+
+/** The reuse penalty for a provider already called `calls` times this trial. */
+function reusePenalty(calls: number): number {
+  if (calls <= 0) return 0;
+  return REUSE_PENALTY_FIRST + REUSE_PENALTY_PER_CALL * (calls - 1);
+}
+
+/**
+ * The candidates for one request, one per provider, in the order to try
+ * them: the planned primary first, then the rest by a budget-aware score --
+ * the rating lost against this request's best model, plus the reuse penalty
+ * for the calls already spent on that provider. A fresh provider's near-best
+ * model therefore beats a tired provider's best one: a provider's first call
+ * can never be a scheduled refusal, so a failover to an unused provider
+ * always lands. A JSON-mode OpenAI request never takes an anthropic-wire
+ * provider: its echo always says json_mode false, and the request would fail
+ * its JSON check.
+ */
+function orderedCandidates(requires: Requirement, api: ClientApi, jsonMode: boolean, requestId: string): Candidate[] {
   const wireRank = (wire: Wire): number => (wire === api ? 0 : wire === 'gemini' ? 1 : 2);
   const dirOrder = new Map(brief.directory.map((d, i) => [d.id, i]));
-  out.sort(
+  const rows: { candidate: Candidate; primary: boolean; score: number }[] = [];
+  let bestRating = 0;
+  const eligible: { provider: RuntimeProvider; model: RuntimeModel }[] = [];
+  for (const p of runtime) {
+    const model = bestModelOf(p, requires);
+    if (model === null) continue;
+    if (jsonMode && p.dir.wire === 'anthropic') continue;
+    eligible.push({ provider: p, model });
+    if (model.rating > bestRating) bestRating = model.rating;
+  }
+  for (const { provider, model } of eligible) {
+    const state = providerState.get(provider.dir.id);
+    if (state?.dead === true) continue;
+    const score = bestRating - model.rating + reusePenalty(state?.calls ?? 0);
+    rows.push({ candidate: { provider, model }, primary: PLAN_PRIMARY[requestId] === provider.dir.id, score });
+  }
+  rows.sort(
     (a, b) =>
-      b.model.rating - a.model.rating ||
-      wireRank(a.provider.dir.wire) - wireRank(b.provider.dir.wire) ||
-      (dirOrder.get(a.provider.dir.id) ?? 99) - (dirOrder.get(b.provider.dir.id) ?? 99) ||
-      (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
+      (a.primary ? 0 : 1) - (b.primary ? 0 : 1) ||
+      a.score - b.score ||
+      b.candidate.model.rating - a.candidate.model.rating ||
+      wireRank(a.candidate.provider.dir.wire) - wireRank(b.candidate.provider.dir.wire) ||
+      (dirOrder.get(a.candidate.provider.dir.id) ?? 99) - (dirOrder.get(b.candidate.provider.dir.id) ?? 99) ||
+      (a.candidate.model.id < b.candidate.model.id ? -1 : a.candidate.model.id > b.candidate.model.id ? 1 : 0),
   );
-  return out;
+  return rows.map((r) => r.candidate);
 }
 
 /** The requirements of the request now arriving: the manifest's row, else the body. */
@@ -1260,49 +1329,51 @@ async function serve(api: ClientApi, body: Json, index: number): Promise<{ statu
   const stream = body.stream === true;
   const requires = requirementsFor(index, body);
   const jsonMode = api === 'openai' && jsonModeOf(body);
-  const candidates = candidatesFor(requires, api, jsonMode);
+  const requestId = brief.workload?.[index]?.id ?? '';
+  const candidates = orderedCandidates(requires, api, jsonMode, requestId);
+  const tried = new Set<string>();
   for (const candidate of candidates) {
-    const state = providerState.get(candidate.provider.dir.id);
+    const providerId = candidate.provider.dir.id;
+    if (tried.has(providerId)) continue;
+    tried.add(providerId);
+    const state = providerState.get(providerId);
     if (state?.dead === true) continue;
-    let attempt = 0;
-    while (attempt < ATTEMPTS_PER_CANDIDATE) {
-      attempt += 1;
-      const res = await callCandidate(candidate, api, body, stream);
-      if (res === null) {
-        // Unreachable: one retry, then the next candidate.
-        if (attempt < ATTEMPTS_PER_CANDIDATE) continue;
-        break;
-      }
-      if (res.status >= 200 && res.status < 300) {
-        const parsed = parseAnswer(candidate.provider.dir.wire, res.text, stream);
-        if (parsed === null) {
-          // The provider answered 2xx, so the env already counts it as the
-          // request's successful call: calling another provider now would
-          // leave two successful calls and fail the one_provider check.
-          // Stop here and let the request go unserved instead.
-          log2(`${candidate.provider.dir.id}/${candidate.model.id} answered 2xx with an unreadable body`);
-          return unserved(api);
-        }
-        log2(`${candidate.provider.dir.id}/${candidate.model.id} answered request ${index + 1}`);
-        const built = api === 'openai' ? openAIClientResponse(candidate.model.id, parsed, stream) : anthropicClientResponse(candidate.model.id, parsed, stream);
-        return { status: 200, ...built };
-      }
-      if (res.status === 402 || res.status === 429 || res.status >= 500) {
-        const message = refusalMessage(res.text);
-        if (isDeadRefusal(message)) {
-          if (state !== undefined) state.dead = true;
-          log2(`${candidate.provider.dir.id} is out for the trial: ${message.slice(0, 120)}`);
-          break;
-        }
-        log2(`${candidate.provider.dir.id}/${candidate.model.id} refused HTTP ${res.status}: ${message.slice(0, 120)}`);
-        if (attempt < ATTEMPTS_PER_CANDIDATE) continue;
-        break;
-      }
-      // A 400 or 401 is this candidate's own fault, not a refusal to retry:
-      // the next candidate is a different model or provider.
-      log2(`${candidate.provider.dir.id}/${candidate.model.id} answered HTTP ${res.status}: ${res.text.slice(0, 200)}`);
-      break;
+    const res = await callCandidate(candidate, api, body, stream);
+    if (res === null) {
+      // Unreachable: never a retry on this provider for this request.
+      log2(`${providerId} is unreachable for request ${index + 1}`);
+      continue;
     }
+    if (res.status >= 200 && res.status < 300) {
+      const parsed = parseAnswer(candidate.provider.dir.wire, res.text, stream);
+      if (parsed === null) {
+        // The provider answered 2xx, so the env already counts it as the
+        // request's successful call: calling another provider now would
+        // leave two successful calls and fail the one_provider check.
+        // Stop here and let the request go unserved instead.
+        log2(`${candidate.provider.dir.id}/${candidate.model.id} answered 2xx with an unreadable body`);
+        return unserved(api);
+      }
+      log2(`${candidate.provider.dir.id}/${candidate.model.id} answered request ${index + 1}`);
+      const built = api === 'openai' ? openAIClientResponse(candidate.model.id, parsed, stream) : anthropicClientResponse(candidate.model.id, parsed, stream);
+      return { status: 200, ...built };
+    }
+    if (res.status === 402 || res.status === 429 || res.status >= 500) {
+      const message = refusalMessage(res.text);
+      if (isDeadRefusal(message)) {
+        if (state !== undefined) state.dead = true;
+        log2(`${candidate.provider.dir.id} is out for the trial: ${message.slice(0, 120)}`);
+        continue;
+      }
+      // A refusal that says this call was refused is never retried on the
+      // same provider for this request: the next candidate is another
+      // provider, and a provider's first call cannot be a scheduled refusal.
+      log2(`${candidate.provider.dir.id}/${candidate.model.id} refused HTTP ${res.status}: ${message.slice(0, 120)}`);
+      continue;
+    }
+    // A 400 or 401 is this candidate's own fault, not a refusal to retry:
+    // the next candidate is a different model or provider.
+    log2(`${candidate.provider.dir.id}/${candidate.model.id} answered HTTP ${res.status}: ${res.text.slice(0, 200)}`);
   }
   return unserved(api);
 }

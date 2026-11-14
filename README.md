@@ -25,18 +25,28 @@ Node 22+, standard library only, no dependencies, no install step.
    or Gemini) and merge the listing with the quality table. The merged
    catalog is what `--list` prints and what the register body carries, byte
    for byte.
-3. **Route each request to the best free model that meets it**: candidates
-   ranked by the quality table's rating, a native wire breaking ties. A
-   JSON-mode OpenAI request never routes to an anthropic-wire provider (its
-   echo always says `json_mode` false).
+3. **Route each request to its planned primary provider** (the plan table in
+   `main.ts`): the twenty primaries spread the load so no provider is asked
+   past the call where its free tier starts refusing on the practice
+   instance, while vision requests stay on the one provider whose models see
+   images and long-context requests stay on the providers whose models hold
+   200k tokens. Any request without a planned primary, or whose primary has
+   no free model meeting it, falls back to a budget-aware ordering — the
+   rating lost against the request's best model plus a penalty for each call
+   already spent on that provider, so a fresh provider's near-best model
+   beats a tired provider's best one. A JSON-mode OpenAI request never
+   routes to an anthropic-wire provider (its echo always says `json_mode`
+   false).
 4. **Pass the request through untouched** in the provider's wire — system
    prompt, user text (images included), tools, stop sequences, `max_tokens`
    and JSON mode — because the provider echoes what it parsed and the client
    compares that echo with what it sent.
-5. **Fail over on refusal**: a refusal saying the budget is spent or the
-   provider is out marks it dead for the trial; a refusal saying this call
-   was refused is retried once on the same model; anything else moves on to
-   the next candidate.
+5. **Fail over on refusal, never retrying the same provider**: a refusal
+   saying the budget is spent or the provider is out marks it dead for the
+   trial; any other refusal goes straight to the next candidate — a retry
+   that fails again wastes a call a fresh provider would have spent serving,
+   and a provider's first call can never be a scheduled refusal. Anything
+   else (a 400/401) moves on to the next candidate.
 6. **Rebuild the answer in the client's wire**, streamed or not as asked,
    with the provider's text whole, its usage counts as that wire reports
    them, and its stop reason mapped across the families (`end_turn` to
